@@ -139,3 +139,51 @@ DEFINE_bool(texture_point_snap, false,
             "centers. Fixes texture seams in titles that use virtual textures, "
             "e.g. idTech 5, but may cause rendering issues in other titles.",
             "GPU");
+
+// Ported from the AC6Recomp project (github.com/sal063/AC6_recomp), which in
+// turn derives from Xenia. Fixes for Ace Combat 6: Fires of Liberation at draw
+// resolution scales above 1x (Direct3D 12 only). Everything is off by default;
+// enable ac6_upscale_fixes in the game-specific config (config/<title ID>
+// .config.toml) rather than globally, since the PsParamGen floor changes
+// rendering for every shader that uses PsParamGen.
+DEFINE_bool(ac6_upscale_fixes, false,
+            "Ace Combat 6: fix the mosaic / pixelated textures seen at draw "
+            "resolution scale above 1x (deferred restore passes and the manual "
+            "texture de-swizzle), and the cutscene depth-of-field striping. "
+            "Enables the PsParamGen guest-position floor, the host sub-pixel "
+            "restore, and the AC6 shader hash lists below, unless those are "
+            "set explicitly. Direct3D 12 only. Only enable it for Ace Combat "
+            "6 (in its game-specific config). Requires a restart.",
+            "GPU");
+DEFINE_bool(param_gen_integer_guest_position, false,
+            "At above-1x draw resolution scale, floor the PsParamGen pixel "
+            "position to the integer guest-pixel index. Fixes mosaic in passes "
+            "doing their own integer pixel-address math. Implied by "
+            "ac6_upscale_fixes.",
+            "GPU.Debug");
+DEFINE_bool(param_gen_host_subpixel_restore, false,
+            "With the PsParamGen guest-position floor: re-add the host "
+            "sub-pixel offset at the texture fetch so restore passes keep full "
+            "scaled detail. Implies param_gen_integer_guest_position. Implied "
+            "by ac6_upscale_fixes.",
+            "GPU.Debug");
+DEFINE_string(ac6_neutralize_deswizzle_hashes, "",
+              "Pixel shader token list \"<hash>[:<slot>[+<slot>...]]\": "
+              "replace matching fetches' manual EDRAM de-swizzle with the "
+              "identity host-texel UV. Empty = AC6 defaults when "
+              "ac6_upscale_fixes is on.",
+              "GPU.Debug");
+DEFINE_string(ac6_snap_guest_texel_hashes, "",
+              "Pixel shader token list: snap matching fetches to guest texel "
+              "centers at above-1x scale. Empty = AC6 defaults when "
+              "ac6_upscale_fixes is on.",
+              "GPU.Debug");
+DEFINE_string(ac6_densify_x_fetch_hashes, "",
+              "Pixel shader token list: densify matching horizontal "
+              "separable-filter fetches at above-1x scale so ghost copies "
+              "merge. Empty = AC6 defaults when ac6_upscale_fixes is on.",
+              "GPU.Debug");
+DEFINE_string(ac6_densify_y_fetch_hashes, "",
+              "As ac6_densify_x_fetch_hashes, for vertical-axis passes. Empty "
+              "= AC6 defaults when ac6_upscale_fixes is on.",
+              "GPU.Debug");

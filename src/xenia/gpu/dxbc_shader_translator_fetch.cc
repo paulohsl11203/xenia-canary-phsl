@@ -7,7 +7,10 @@
  ******************************************************************************
  */
 
+#include <algorithm>
 #include <cmath>
+#include <cstdlib>
+#include <string>
 
 #include "third_party/fmt/include/fmt/format.h"
 #include "xenia/base/assert.h"
@@ -19,6 +22,78 @@
 
 namespace xe {
 namespace gpu {
+
+namespace {
+// Ace Combat 6 fixes for draw resolution scales above 1x, ported from AC6Recomp
+// (github.com/sal063/AC6_recomp). The shader hashes are the XXH3 hashes of the
+// guest ucode, the same as Shader::ucode_data_hash.
+constexpr char kAc6DefaultNeutralizeDeswizzleHashes[] =
+    "7d22894002d16018, 17e5e4ac3e713245:4";
+constexpr char kAc6DefaultSnapGuestTexelHashes[] =
+    "85d733927e3bba9c, d050dfa6f58567f6";
+constexpr char kAc6DefaultDensifyXFetchHashes[] = "6328f9c40913c82c";
+constexpr char kAc6DefaultDensifyYFetchHashes[] = "5bd20f9d0d911687";
+
+// Returns the explicitly configured hash list, or the AC6 default if the list
+// is empty and ac6_upscale_fixes is enabled.
+std::string GetAc6HashList(const std::string& configured,
+                           const char* ac6_default) {
+  if (!configured.empty()) {
+    return configured;
+  }
+  return cvars::ac6_upscale_fixes ? std::string(ac6_default) : std::string();
+}
+
+// Returns true if `hash` + `tfetch_index` is allowlisted by `list`, a string of
+// tokens separated by commas, spaces or semicolons. Each token is
+// "<hex hash>[:<slot>[+<slot>...]]" (optional "0x" prefix on the hash): a bare
+// hash matches all fetch slots of that shader; with ":4" or ":1+2", only the
+// listed Xenos tfetch slots match.
+bool UcodeHashSlotInList(uint64_t hash, uint32_t tfetch_index,
+                         const std::string& list) {
+  auto is_sep = [](char c) {
+    return c == ',' || c == ';' || c == ' ' || c == '\t' || c == '\n' ||
+           c == '\r';
+  };
+  size_t i = 0, n = list.size();
+  while (i < n) {
+    while (i < n && is_sep(list[i])) {
+      ++i;
+    }
+    size_t start = i;
+    while (i < n && !is_sep(list[i])) {
+      ++i;
+    }
+    if (i > start) {
+      std::string token = list.substr(start, i - start);
+      size_t colon = token.find(':');
+      std::string hash_part =
+          colon == std::string::npos ? token : token.substr(0, colon);
+      if (std::strtoull(hash_part.c_str(), nullptr, 16) == hash) {
+        if (colon == std::string::npos) {
+          // No slot list - all slots.
+          return true;
+        }
+        size_t p = colon + 1;
+        while (p < token.size()) {
+          size_t q = token.find('+', p);
+          if (q == std::string::npos) {
+            q = token.size();
+          }
+          if (q > p && std::strtoul(token.substr(p, q - p).c_str(), nullptr,
+                                    10) == tfetch_index) {
+            return true;
+          }
+          p = q + 1;
+        }
+        // The hash matched, but this slot isn't listed - keep scanning (the
+        // same hash may appear again with other slots).
+      }
+    }
+  }
+  return false;
+}
+}  // namespace
 using namespace ucode;
 
 void DxbcShaderTranslator::ProcessVertexFetchInstruction(
@@ -763,6 +838,83 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
   bool point_snap =
       cvars::texture_point_snap && instr.CanSnapToTexelCenter(use_computed_lod);
 
+  // Ace Combat 6 fixes for draw resolution scales above 1x (ported from
+  // AC6Recomp), all limited to normalized 2D texture fetches in pixel shaders.
+  bool ac6_fix_eligible_fetch =
+      instr.opcode == FetchOpcode::kTextureFetch &&
+      !instr.attributes.unnormalized_coordinates &&
+      instr.dimension == xenos::FetchOpDimension::k2D && is_pixel_shader();
+  uint32_t ac6_position_scale_x = GetCurrentDrawResolutionScaleX();
+  uint32_t ac6_position_scale_y = GetCurrentDrawResolutionScaleY();
+  // Host sub-pixel restore: with the PsParamGen floor, the de-swizzle passes
+  // that derive their coordinates from the pixel position sample the guest
+  // texel center, losing the host sub-pixel. Re-add it after the coordinate is
+  // normalized, so the sample lands on the exact host texel - true
+  // resolution-scaled detail.
+  bool apply_host_subpixel_correction =
+      ac6_fix_eligible_fetch &&
+      GetDxbcShaderModification().pixel.param_gen_enable &&
+      (ac6_position_scale_x > 1 || ac6_position_scale_y > 1) &&
+      (cvars::param_gen_host_subpixel_restore || cvars::ac6_upscale_fixes);
+  // De-swizzle neutralization: some AC6 full-screen restore / resample passes
+  // manually de-swizzle the Xenos sub-tile layout of their source. The texture
+  // cache stores the source already detiled to linear, so the same de-swizzle
+  // scrambles it. For allowlisted fetches, replace the scrambled coordinate
+  // with the identity host-texel UV, SV_Position.xy / (guest size * scale), a
+  // 1:1 copy. The layout mismatch is scale-independent, so this applies at all
+  // draw resolution scales.
+  bool apply_deswizzle_identity = false;
+  if (ac6_fix_eligible_fetch &&
+      GetDxbcShaderModification().pixel.param_gen_enable) {
+    std::string neutralize_hashes =
+        GetAc6HashList(cvars::ac6_neutralize_deswizzle_hashes,
+                       kAc6DefaultNeutralizeDeswizzleHashes);
+    apply_deswizzle_identity =
+        !neutralize_hashes.empty() &&
+        UcodeHashSlotInList(current_shader().ucode_data_hash(), tfetch_index,
+                            neutralize_hashes);
+  }
+  // Guest texel snap for scale-broken filter kernels: the AC6 cutscene
+  // depth-of-field gather pair builds its kernel out of fractional guest texel
+  // tap offsets whose bilinear blend ratios are tuned for the guest texel grid.
+  // Against a resolution-scaled texture, they alias into striping. Snap the
+  // final coordinate to the guest texel center, where bilinear filtering of a
+  // scaled texture returns the box average of the guest texel.
+  bool apply_guest_texel_snap = false;
+  if (ac6_fix_eligible_fetch &&
+      (draw_resolution_scale_x_ > 1 || draw_resolution_scale_y_ > 1)) {
+    std::string snap_hashes = GetAc6HashList(cvars::ac6_snap_guest_texel_hashes,
+                                             kAc6DefaultSnapGuestTexelHashes);
+    apply_guest_texel_snap =
+        !snap_hashes.empty() &&
+        UcodeHashSlotInList(current_shader().ucode_data_hash(), tfetch_index,
+                            snap_hashes);
+  }
+  // Axis densification for separable sparse-kernel passes (the AC6
+  // depth-of-field gathers): each allowlisted fetch becomes the average of
+  // 2 * scale samples spread along the pass axis across one guest texel half
+  // gap on each side of the tap, so ghost copies of features thinner than the
+  // tap spacing merge at any resolution scale.
+  uint32_t densify_axis_samples[2] = {0, 0};
+  if (ac6_fix_eligible_fetch) {
+    std::string densify_x_hashes = GetAc6HashList(
+        cvars::ac6_densify_x_fetch_hashes, kAc6DefaultDensifyXFetchHashes);
+    if (draw_resolution_scale_x_ > 1 && !densify_x_hashes.empty() &&
+        UcodeHashSlotInList(current_shader().ucode_data_hash(), tfetch_index,
+                            densify_x_hashes)) {
+      densify_axis_samples[0] = 2 * draw_resolution_scale_x_;
+    }
+    std::string densify_y_hashes = GetAc6HashList(
+        cvars::ac6_densify_y_fetch_hashes, kAc6DefaultDensifyYFetchHashes);
+    if (draw_resolution_scale_y_ > 1 && !densify_y_hashes.empty() &&
+        UcodeHashSlotInList(current_shader().ucode_data_hash(), tfetch_index,
+                            densify_y_hashes)) {
+      densify_axis_samples[1] = 2 * draw_resolution_scale_y_;
+    }
+  }
+  bool apply_cluster_filter =
+      densify_axis_samples[0] != 0 || densify_axis_samples[1] != 0;
+
   // Get offsets applied to the coordinates before sampling.
   // `offsets` is used for float4 literal construction,
   // FIXME(Triang3l): Offsets need to be applied at the LOD being fetched, not
@@ -911,6 +1063,12 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
         size_needed_components &= 0b0011;
         break;
     }
+  }
+  if (apply_host_subpixel_correction || apply_deswizzle_identity ||
+      apply_guest_texel_snap || apply_cluster_filter) {
+    // The AC6 fixes need the guest texture width and height to convert
+    // positions and offsets into normalized texture space.
+    size_needed_components |= 0b0011;
   }
   if (instr.dimension == xenos::FetchOpDimension::k3DOrStacked &&
       size_needed_components) {
@@ -1341,6 +1499,98 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
           a_.OpEndIf();
         }
       }
+    }
+    if (apply_host_subpixel_correction) {
+      // coord_and_sampler_temp.xy is the final normalized coordinate, sampling
+      // the guest texel center. Shift it to the current host sub-pixel so it
+      // samples the host-resolution texel, landing on an exact texel center.
+      uint32_t host_subpixel_temp = PushSystemTemp();
+      // host_subpixel.xy = floor(SV_Position.xy) mod draw resolution scale.
+      in_position_used_ |= 0b0011;
+      a_.OpFToU(dxbc::Dest::R(host_subpixel_temp, 0b0011),
+                dxbc::Src::V1D(in_reg_ps_position_));
+      a_.OpUDiv(
+          dxbc::Dest::Null(), dxbc::Dest::R(host_subpixel_temp, 0b0011),
+          dxbc::Src::R(host_subpixel_temp),
+          dxbc::Src::LU(ac6_position_scale_x, ac6_position_scale_y, 1, 1));
+      a_.OpUToF(dxbc::Dest::R(host_subpixel_temp, 0b0011),
+                dxbc::Src::R(host_subpixel_temp));
+      // delta.xy = (host_subpixel - (scale - 1) / 2) / (guest size * scale).
+      a_.OpAdd(dxbc::Dest::R(host_subpixel_temp, 0b0011),
+               dxbc::Src::R(host_subpixel_temp),
+               dxbc::Src::LF(-(float(ac6_position_scale_x) - 1.0f) * 0.5f,
+                             -(float(ac6_position_scale_y) - 1.0f) * 0.5f, 0.0f,
+                             0.0f));
+      a_.OpDiv(dxbc::Dest::R(host_subpixel_temp, 0b0011),
+               dxbc::Src::R(host_subpixel_temp),
+               dxbc::Src::R(size_and_is_3d_temp));
+      a_.OpMul(dxbc::Dest::R(host_subpixel_temp, 0b0011),
+               dxbc::Src::R(host_subpixel_temp),
+               dxbc::Src::LF(1.0f / float(ac6_position_scale_x),
+                             1.0f / float(ac6_position_scale_y), 0.0f, 0.0f));
+      // Only resolution-scaled textures are stored at the host resolution.
+      a_.OpAnd(dxbc::Dest::R(host_subpixel_temp, 0b0100),
+               LoadSystemConstant(
+                   SystemConstants::Index::kTexturesResolutionScaled,
+                   offsetof(SystemConstants, textures_resolution_scaled),
+                   dxbc::Src::kXXXX),
+               dxbc::Src::LU(uint32_t(1) << tfetch_index));
+      a_.OpIf(true, dxbc::Src::R(host_subpixel_temp, dxbc::Src::kZZZZ));
+      a_.OpAdd(dxbc::Dest::R(coord_and_sampler_temp, 0b0011),
+               dxbc::Src::R(coord_and_sampler_temp),
+               dxbc::Src::R(host_subpixel_temp));
+      a_.OpEndIf();
+      // Release host_subpixel_temp.
+      PopSystemTemp();
+    }
+    if (apply_deswizzle_identity) {
+      // coord_and_sampler_temp.xy is the guest de-swizzled coordinate, but the
+      // texture cache stores the source detiled to linear, so the de-swizzle is
+      // always a wrong texel permutation here. Replace it with the identity
+      // host texel UV, SV_Position.xy / (guest size * scale), so the pass
+      // copies its source 1:1.
+      uint32_t deswizzle_temp = PushSystemTemp();
+      in_position_used_ |= 0b0011;
+      // deswizzle_temp.xy = guest size * draw resolution scale = host size.
+      a_.OpMul(dxbc::Dest::R(deswizzle_temp, 0b0011),
+               dxbc::Src::R(size_and_is_3d_temp),
+               dxbc::Src::LF(float(ac6_position_scale_x),
+                             float(ac6_position_scale_y), 1.0f, 1.0f));
+      // coord.xy = SV_Position.xy / host size = identity texel center UV.
+      a_.OpDiv(dxbc::Dest::R(coord_and_sampler_temp, 0b0011),
+               dxbc::Src::V1D(in_reg_ps_position_),
+               dxbc::Src::R(deswizzle_temp));
+      // Release deswizzle_temp.
+      PopSystemTemp();
+    }
+    if (apply_guest_texel_snap) {
+      // Snap the final normalized coordinate to the guest texel center so the
+      // allowlisted kernel samples the guest grid regardless of the host
+      // storage resolution.
+      uint32_t snap_temp = PushSystemTemp();
+      // snap_temp.xy = (floor(uv * guest size) + 0.5) / guest size.
+      a_.OpMul(dxbc::Dest::R(snap_temp, 0b0011),
+               dxbc::Src::R(coord_and_sampler_temp),
+               dxbc::Src::R(size_and_is_3d_temp));
+      a_.OpRoundNI(dxbc::Dest::R(snap_temp, 0b0011), dxbc::Src::R(snap_temp));
+      a_.OpAdd(dxbc::Dest::R(snap_temp, 0b0011), dxbc::Src::R(snap_temp),
+               dxbc::Src::LF(0.5f, 0.5f, 0.0f, 0.0f));
+      a_.OpDiv(dxbc::Dest::R(snap_temp, 0b0011), dxbc::Src::R(snap_temp),
+               dxbc::Src::R(size_and_is_3d_temp));
+      // Only textures stored at the host resolution have a finer grid than the
+      // kernel was tuned for - guest-resolution sources stay unchanged.
+      a_.OpAnd(dxbc::Dest::R(snap_temp, 0b0100),
+               LoadSystemConstant(
+                   SystemConstants::Index::kTexturesResolutionScaled,
+                   offsetof(SystemConstants, textures_resolution_scaled),
+                   dxbc::Src::kXXXX),
+               dxbc::Src::LU(uint32_t(1) << tfetch_index));
+      a_.OpIf(true, dxbc::Src::R(snap_temp, dxbc::Src::kZZZZ));
+      a_.OpMov(dxbc::Dest::R(coord_and_sampler_temp, 0b0011),
+               dxbc::Src::R(snap_temp));
+      a_.OpEndIf();
+      // Release snap_temp.
+      PopSystemTemp();
     }
     switch (instr.dimension) {
       case xenos::FetchOpDimension::k1D: {
@@ -2195,114 +2445,199 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
                            uint32_t(SRVMainRegister::kBindfulTexturesStart) +
                                texture_binding_index_signed);
         }
-        for (uint32_t layer = 0; layer < (layer_lerp_needed ? 2u : 1u);
-             ++layer) {
-          uint32_t layer_value_temp = system_temp_result_;
-          if (layer) {
-            layer_value_temp = PushSystemTemp();
-            // Check if the lerp factor is not zero (or NaN).
-            a_.OpNE(dxbc::Dest::R(layer_value_temp, 0b0001),
-                    layer_lerp_factor_src, dxbc::Src::LF(0.0f));
-            // If the lerp factor is not zero, sample the next layer.
-            a_.OpIf(true, dxbc::Src::R(layer_value_temp, dxbc::Src::kXXXX));
-            // Go to the next layer.
-            a_.OpAdd(dxbc::Dest::R(coord_and_sampler_temp, 0b0100),
-                     dxbc::Src::R(coord_and_sampler_temp, dxbc::Src::kZZZZ),
-                     dxbc::Src::LF(1.0f));
+        // AC6 tap densification (see apply_cluster_filter): emit the whole
+        // sample block once per cluster offset around the original coordinate
+        // and average the raw results. Only for plain 2D fetches.
+        bool cluster_this_srv = apply_cluster_filter &&
+                                srv_dimension == xenos::FetchOpDimension::k2D &&
+                                !layer_lerp_needed;
+        float cluster_dx[64];
+        float cluster_dy[64];
+        uint32_t cluster_count = 1;
+        cluster_dx[0] = 0.0f;
+        cluster_dy[0] = 0.0f;
+        if (cluster_this_srv) {
+          float xs[8], ys[8];
+          uint32_t nx = 1, ny = 1;
+          xs[0] = 0.0f;
+          ys[0] = 0.0f;
+          if (densify_axis_samples[0]) {
+            nx = std::min(densify_axis_samples[0], uint32_t(8));
+            for (uint32_t j = 0; j < nx; ++j) {
+              xs[j] = (float(j) + 0.5f) * 2.0f / float(nx) - 1.0f;
+            }
           }
-          // Always 3 coordinate components (1D and 2D are padded to 2D arrays,
-          // 3D and cube have 3 coordinate dimensions).
-          a_.OpIf(false, is_all_signed_src);
-          {
-            // Sample the unsigned texture.
-            if (bindless_resources_used_) {
-              // Load the unsigned texture descriptor index.
-              assert_true(srv_selection_temp != UINT32_MAX);
-              if (cbuffer_index_descriptor_indices_ ==
-                  kBindingIndexUnallocated) {
-                cbuffer_index_descriptor_indices_ = cbuffer_count_++;
+          if (densify_axis_samples[1]) {
+            ny = std::min(densify_axis_samples[1], uint32_t(8));
+            for (uint32_t j = 0; j < ny; ++j) {
+              ys[j] = (float(j) + 0.5f) * 2.0f / float(ny) - 1.0f;
+            }
+          }
+          cluster_count = 0;
+          for (uint32_t jy = 0; jy < ny; ++jy) {
+            for (uint32_t jx = 0; jx < nx; ++jx) {
+              cluster_dx[cluster_count] = xs[jx];
+              cluster_dy[cluster_count] = ys[jy];
+              ++cluster_count;
+            }
+          }
+        }
+        uint32_t cluster_accum_temp = UINT32_MAX;
+        uint32_t cluster_coord_temp = UINT32_MAX;
+        uint32_t cluster_passes = cluster_this_srv ? cluster_count : 1;
+        if (cluster_this_srv) {
+          cluster_accum_temp = PushSystemTemp();
+          cluster_coord_temp = PushSystemTemp();
+          // The original tap coordinate (and the sampler index in W).
+          a_.OpMov(dxbc::Dest::R(cluster_coord_temp),
+                   dxbc::Src::R(coord_and_sampler_temp));
+        }
+        for (uint32_t cluster_pass = 0; cluster_pass < cluster_passes;
+             ++cluster_pass) {
+          if (cluster_this_srv) {
+            // coord.xy = original + cluster offset (guest texels) / guest size.
+            a_.OpDiv(dxbc::Dest::R(coord_and_sampler_temp, 0b0011),
+                     dxbc::Src::LF(cluster_dx[cluster_pass],
+                                   cluster_dy[cluster_pass], 0.0f, 0.0f),
+                     dxbc::Src::R(size_and_is_3d_temp));
+            a_.OpAdd(dxbc::Dest::R(coord_and_sampler_temp, 0b0011),
+                     dxbc::Src::R(coord_and_sampler_temp),
+                     dxbc::Src::R(cluster_coord_temp));
+          }
+          for (uint32_t layer = 0; layer < (layer_lerp_needed ? 2u : 1u);
+               ++layer) {
+            uint32_t layer_value_temp = system_temp_result_;
+            if (layer) {
+              layer_value_temp = PushSystemTemp();
+              // Check if the lerp factor is not zero (or NaN).
+              a_.OpNE(dxbc::Dest::R(layer_value_temp, 0b0001),
+                      layer_lerp_factor_src, dxbc::Src::LF(0.0f));
+              // If the lerp factor is not zero, sample the next layer.
+              a_.OpIf(true, dxbc::Src::R(layer_value_temp, dxbc::Src::kXXXX));
+              // Go to the next layer.
+              a_.OpAdd(dxbc::Dest::R(coord_and_sampler_temp, 0b0100),
+                       dxbc::Src::R(coord_and_sampler_temp, dxbc::Src::kZZZZ),
+                       dxbc::Src::LF(1.0f));
+            }
+            // Always 3 coordinate components (1D and 2D are padded to 2D
+            // arrays, 3D and cube have 3 coordinate dimensions).
+            a_.OpIf(false, is_all_signed_src);
+            {
+              // Sample the unsigned texture.
+              if (bindless_resources_used_) {
+                // Load the unsigned texture descriptor index.
+                assert_true(srv_selection_temp != UINT32_MAX);
+                if (cbuffer_index_descriptor_indices_ ==
+                    kBindingIndexUnallocated) {
+                  cbuffer_index_descriptor_indices_ = cbuffer_count_++;
+                }
+                uint32_t texture_bindless_descriptor_index =
+                    texture_binding_unsigned.bindless_descriptor_index;
+                a_.OpMov(
+                    dxbc::Dest::R(srv_selection_temp, 0b1000),
+                    dxbc::Src::CB(cbuffer_index_descriptor_indices_,
+                                  uint32_t(CbufferRegister::kDescriptorIndices),
+                                  texture_bindless_descriptor_index >> 2)
+                        .Select(texture_bindless_descriptor_index & 3));
               }
-              uint32_t texture_bindless_descriptor_index =
-                  texture_binding_unsigned.bindless_descriptor_index;
-              a_.OpMov(
-                  dxbc::Dest::R(srv_selection_temp, 0b1000),
-                  dxbc::Src::CB(cbuffer_index_descriptor_indices_,
-                                uint32_t(CbufferRegister::kDescriptorIndices),
-                                texture_bindless_descriptor_index >> 2)
-                      .Select(texture_bindless_descriptor_index & 3));
-            }
-            if (grad_v_temp != UINT32_MAX) {
-              assert_not_zero(grad_component_count);
-              a_.OpSampleD(dxbc::Dest::R(layer_value_temp,
-                                         used_result_nonzero_components),
-                           dxbc::Src::R(coord_and_sampler_temp), 3,
-                           srv_unsigned, sampler, dxbc::Src::R(grad_h_lod_temp),
-                           dxbc::Src::R(grad_v_temp), srv_grad_component_count);
-            } else {
-              a_.OpSampleL(dxbc::Dest::R(layer_value_temp,
-                                         used_result_nonzero_components),
-                           dxbc::Src::R(coord_and_sampler_temp), 3,
-                           srv_unsigned, sampler, lod_src);
-            }
-          }
-          a_.OpEndIf();
-          a_.OpIf(true, is_any_signed_src);
-          {
-            // Sample the signed texture.
-            uint32_t signed_temp = PushSystemTemp();
-            if (bindless_resources_used_) {
-              // Load the signed texture descriptor index.
-              assert_true(srv_selection_temp != UINT32_MAX);
-              if (cbuffer_index_descriptor_indices_ ==
-                  kBindingIndexUnallocated) {
-                cbuffer_index_descriptor_indices_ = cbuffer_count_++;
+              if (grad_v_temp != UINT32_MAX) {
+                assert_not_zero(grad_component_count);
+                a_.OpSampleD(
+                    dxbc::Dest::R(layer_value_temp,
+                                  used_result_nonzero_components),
+                    dxbc::Src::R(coord_and_sampler_temp), 3, srv_unsigned,
+                    sampler, dxbc::Src::R(grad_h_lod_temp),
+                    dxbc::Src::R(grad_v_temp), srv_grad_component_count);
+              } else {
+                a_.OpSampleL(dxbc::Dest::R(layer_value_temp,
+                                           used_result_nonzero_components),
+                             dxbc::Src::R(coord_and_sampler_temp), 3,
+                             srv_unsigned, sampler, lod_src);
               }
-              uint32_t texture_bindless_descriptor_index =
-                  texture_binding_signed.bindless_descriptor_index;
-              a_.OpMov(
-                  dxbc::Dest::R(srv_selection_temp, 0b1000),
-                  dxbc::Src::CB(cbuffer_index_descriptor_indices_,
-                                uint32_t(CbufferRegister::kDescriptorIndices),
-                                texture_bindless_descriptor_index >> 2)
-                      .Select(texture_bindless_descriptor_index & 3));
             }
-            if (grad_v_temp != UINT32_MAX) {
-              assert_not_zero(grad_component_count);
-              a_.OpSampleD(
-                  dxbc::Dest::R(signed_temp, used_result_nonzero_components),
-                  dxbc::Src::R(coord_and_sampler_temp), 3, srv_signed, sampler,
-                  dxbc::Src::R(grad_h_lod_temp), dxbc::Src::R(grad_v_temp),
-                  srv_grad_component_count);
-            } else {
-              a_.OpSampleL(
-                  dxbc::Dest::R(signed_temp, used_result_nonzero_components),
-                  dxbc::Src::R(coord_and_sampler_temp), 3, srv_signed, sampler,
-                  lod_src);
-            }
-            a_.OpMovC(
-                dxbc::Dest::R(layer_value_temp, used_result_nonzero_components),
-                dxbc::Src::R(is_signed_temp), dxbc::Src::R(signed_temp),
-                dxbc::Src::R(layer_value_temp));
-            // Release signed_temp.
-            PopSystemTemp();
-          }
-          a_.OpEndIf();
-          if (layer) {
-            assert_true(layer_value_temp != system_temp_result_);
-            // Interpolate between the two layers.
-            a_.OpAdd(
-                dxbc::Dest::R(layer_value_temp, used_result_nonzero_components),
-                dxbc::Src::R(layer_value_temp),
-                -dxbc::Src::R(system_temp_result_));
-            a_.OpMAd(dxbc::Dest::R(system_temp_result_,
-                                   used_result_nonzero_components),
-                     dxbc::Src::R(layer_value_temp), layer_lerp_factor_src,
-                     dxbc::Src::R(system_temp_result_));
-            // Close the linear filtering check.
             a_.OpEndIf();
-            // Release the allocated layer_value_temp.
-            PopSystemTemp();
+            a_.OpIf(true, is_any_signed_src);
+            {
+              // Sample the signed texture.
+              uint32_t signed_temp = PushSystemTemp();
+              if (bindless_resources_used_) {
+                // Load the signed texture descriptor index.
+                assert_true(srv_selection_temp != UINT32_MAX);
+                if (cbuffer_index_descriptor_indices_ ==
+                    kBindingIndexUnallocated) {
+                  cbuffer_index_descriptor_indices_ = cbuffer_count_++;
+                }
+                uint32_t texture_bindless_descriptor_index =
+                    texture_binding_signed.bindless_descriptor_index;
+                a_.OpMov(
+                    dxbc::Dest::R(srv_selection_temp, 0b1000),
+                    dxbc::Src::CB(cbuffer_index_descriptor_indices_,
+                                  uint32_t(CbufferRegister::kDescriptorIndices),
+                                  texture_bindless_descriptor_index >> 2)
+                        .Select(texture_bindless_descriptor_index & 3));
+              }
+              if (grad_v_temp != UINT32_MAX) {
+                assert_not_zero(grad_component_count);
+                a_.OpSampleD(
+                    dxbc::Dest::R(signed_temp, used_result_nonzero_components),
+                    dxbc::Src::R(coord_and_sampler_temp), 3, srv_signed,
+                    sampler, dxbc::Src::R(grad_h_lod_temp),
+                    dxbc::Src::R(grad_v_temp), srv_grad_component_count);
+              } else {
+                a_.OpSampleL(
+                    dxbc::Dest::R(signed_temp, used_result_nonzero_components),
+                    dxbc::Src::R(coord_and_sampler_temp), 3, srv_signed,
+                    sampler, lod_src);
+              }
+              a_.OpMovC(dxbc::Dest::R(layer_value_temp,
+                                      used_result_nonzero_components),
+                        dxbc::Src::R(is_signed_temp), dxbc::Src::R(signed_temp),
+                        dxbc::Src::R(layer_value_temp));
+              // Release signed_temp.
+              PopSystemTemp();
+            }
+            a_.OpEndIf();
+            if (layer) {
+              assert_true(layer_value_temp != system_temp_result_);
+              // Interpolate between the two layers.
+              a_.OpAdd(dxbc::Dest::R(layer_value_temp,
+                                     used_result_nonzero_components),
+                       dxbc::Src::R(layer_value_temp),
+                       -dxbc::Src::R(system_temp_result_));
+              a_.OpMAd(dxbc::Dest::R(system_temp_result_,
+                                     used_result_nonzero_components),
+                       dxbc::Src::R(layer_value_temp), layer_lerp_factor_src,
+                       dxbc::Src::R(system_temp_result_));
+              // Close the linear filtering check.
+              a_.OpEndIf();
+              // Release the allocated layer_value_temp.
+              PopSystemTemp();
+            }
           }
+          if (cluster_this_srv) {
+            if (cluster_pass == 0) {
+              a_.OpMov(dxbc::Dest::R(cluster_accum_temp,
+                                     used_result_nonzero_components),
+                       dxbc::Src::R(system_temp_result_));
+            } else {
+              a_.OpAdd(dxbc::Dest::R(cluster_accum_temp,
+                                     used_result_nonzero_components),
+                       dxbc::Src::R(cluster_accum_temp),
+                       dxbc::Src::R(system_temp_result_));
+            }
+          }
+        }
+        if (cluster_this_srv) {
+          // The value of the tap is the average of the cluster samples.
+          a_.OpMul(dxbc::Dest::R(system_temp_result_,
+                                 used_result_nonzero_components),
+                   dxbc::Src::R(cluster_accum_temp),
+                   dxbc::Src::LF(1.0f / float(cluster_passes)));
+          // Restore the original coordinate for any later use.
+          a_.OpMov(dxbc::Dest::R(coord_and_sampler_temp),
+                   dxbc::Src::R(cluster_coord_temp));
+          // Release cluster_coord_temp and cluster_accum_temp.
+          PopSystemTemp(2);
         }
       }
       if (instr.dimension == xenos::FetchOpDimension::k3DOrStacked) {

@@ -757,6 +757,22 @@ void DxbcShaderTranslator::StartPixelShader() {
           dxbc::Src::R(param_gen_temp),
           dxbc::Src::LF(1.0f / GetCurrentDrawResolutionScaleX(),
                         1.0f / GetCurrentDrawResolutionScaleY(), 1.0f, 1.0f));
+      if (cvars::param_gen_integer_guest_position ||
+          cvars::param_gen_host_subpixel_restore || cvars::ac6_upscale_fixes) {
+        // Snap the reverted position to the integer guest-pixel index (ported
+        // from AC6Recomp). The multiply above leaves a sub-guest-pixel fraction
+        // (for example, .5 at 2x), which is correct only for shaders that feed
+        // PsParamGen straight to tfetch. Games that instead do integer
+        // pixel-address math on the position (Ace Combat 6's deferred EDRAM
+        // restore / de-swizzle passes) break, because their frac()-based bit
+        // extraction sees a doubled period at above 1x and scrambles the
+        // sample coordinate into an 8x8 mosaic. Flooring here makes that math
+        // operate on integer guest pixels again. The host sub-pixel restore
+        // (param_gen_host_subpixel_restore) re-adds the sub-pixel at the
+        // texture fetch so those passes regain the full host resolution.
+        a_.OpRoundNI(dxbc::Dest::R(param_gen_temp, resolution_scaled_axes),
+                     dxbc::Src::R(param_gen_temp));
+      }
     }
     // Add the window offset back when it's carried in the EDRAM bases.
     // PsParamGen includes it.

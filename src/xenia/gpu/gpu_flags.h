@@ -55,6 +55,20 @@ DECLARE_bool(xenos_sample_positions);
 
 DECLARE_bool(texture_point_snap);
 
+DECLARE_bool(ac6_upscale_fixes);
+
+DECLARE_bool(param_gen_integer_guest_position);
+
+DECLARE_bool(param_gen_host_subpixel_restore);
+
+DECLARE_string(ac6_neutralize_deswizzle_hashes);
+
+DECLARE_string(ac6_snap_guest_texel_hashes);
+
+DECLARE_string(ac6_densify_x_fetch_hashes);
+
+DECLARE_string(ac6_densify_y_fetch_hashes);
+
 #define XE_GPU_FINE_GRAINED_DRAW_SCOPES 1
 
 #endif  // XENIA_GPU_GPU_FLAGS_H_
