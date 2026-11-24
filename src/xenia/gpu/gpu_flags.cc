@@ -187,3 +187,11 @@ DEFINE_string(ac6_densify_y_fetch_hashes, "",
               "As ac6_densify_x_fetch_hashes, for vertical-axis passes. Empty "
               "= AC6 defaults when ac6_upscale_fixes is on.",
               "GPU.Debug");
+DEFINE_bool(ac6_scale_texture_weights, false,
+            "Experimental: calculate getWeights texture fetch results in the "
+            "host texel space of resolution-scaled textures, as AC6Recomp "
+            "does, instead of the guest texel space. Being tested for the "
+            "blocky missile fire and smoke in Ace Combat 6 at draw resolution "
+            "scale above 1x. Requires draw_resolution_scaled_texture_offsets. "
+            "Requires a restart.",
+            "GPU");

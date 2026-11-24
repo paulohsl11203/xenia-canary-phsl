@@ -69,6 +69,8 @@ DECLARE_string(ac6_densify_x_fetch_hashes);
 
 DECLARE_string(ac6_densify_y_fetch_hashes);
 
+DECLARE_bool(ac6_scale_texture_weights);
+
 #define XE_GPU_FINE_GRAINED_DRAW_SCOPES 1
 
 #endif  // XENIA_GPU_GPU_FLAGS_H_

@@ -1218,6 +1218,59 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
         LoadOperand(instr.operands[0], used_result_nonzero_components,
                     coord_operand_temp_pushed);
     dxbc::Src coord_src(coord_operand);
+    if (cvars::ac6_scale_texture_weights) {
+      // Experimental (AC6Recomp behavior): calculate the weights in the host
+      // texel space of resolution-scaled textures, by applying the resolution
+      // scale to the width / height and the unnormalized coordinates, so manual
+      // bilinear filtering done by the game (with offsets scaled by
+      // draw_resolution_scaled_texture_offsets) blends between host texels.
+      uint32_t resolution_scaled_result_components =
+          used_result_nonzero_components & revert_resolution_scale_axes;
+      uint32_t resolution_scaled_coord_components =
+          instr.attributes.unnormalized_coordinates
+              ? resolution_scaled_result_components
+              : 0b0000;
+      uint32_t resolution_scaled_size_components =
+          size_needed_components & resolution_scaled_result_components;
+      if (resolution_scaled_coord_components ||
+          resolution_scaled_size_components) {
+        if (resolution_scaled_coord_components &&
+            (coord_src.type_ != dxbc::OperandType::kTemp ||
+             coord_src.index_1d_.index_ != system_temp_result_)) {
+          // Use system_temp_result_ as a temporary for conditionally
+          // resolution-scaled coordinates.
+          a_.OpMov(dxbc::Dest::R(system_temp_result_,
+                                 used_result_nonzero_components),
+                   coord_src);
+          coord_src = dxbc::Src::R(system_temp_result_);
+        }
+        // Using system_temp_result_.w as a temporary for the flag indicating
+        // whether the texture is resolution-scaled - not involved in
+        // coordinate calculations.
+        assert_zero(used_result_nonzero_components & 0b1000);
+        a_.OpAnd(dxbc::Dest::R(system_temp_result_, 0b1000),
+                 LoadSystemConstant(
+                     SystemConstants::Index::kTexturesResolutionScaled,
+                     offsetof(SystemConstants, textures_resolution_scaled),
+                     dxbc::Src::kXXXX),
+                 dxbc::Src::LU(uint32_t(1) << tfetch_index));
+        a_.OpIf(true, dxbc::Src::R(system_temp_result_, dxbc::Src::kWWWW));
+        dxbc::Src resolution_scale_src(
+            dxbc::Src::LF(float(draw_resolution_scale_x_),
+                          float(draw_resolution_scale_y_), 1.0f, 1.0f));
+        if (resolution_scaled_coord_components) {
+          a_.OpMul(dxbc::Dest::R(system_temp_result_,
+                                 resolution_scaled_coord_components),
+                   coord_src, resolution_scale_src);
+        }
+        if (resolution_scaled_size_components) {
+          a_.OpMul(dxbc::Dest::R(size_and_is_3d_temp,
+                                 resolution_scaled_size_components),
+                   dxbc::Src::R(size_and_is_3d_temp), resolution_scale_src);
+        }
+        a_.OpEndIf();
+      }
+    }
     uint32_t offsets_needed = offsets_not_zero & used_result_nonzero_components;
     if (!instr.attributes.unnormalized_coordinates || offsets_needed) {
       // Using system_temp_result_ as a temporary for coordinate denormalization
